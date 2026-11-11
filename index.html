@@ -1,0 +1,444 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pole Climbing 360 Simulator</title><style>body{margin:0;background:#101820;color:white;font:15px Arial}header{padding:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#202d39}.settings-panel{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:#243642;padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.15)}button,input{font:inherit}button{padding:8px 12px;cursor:pointer}#scene{height:calc(100vh - 155px);width:100%}#status{padding:9px;color:#b9d4e9}label{display:flex;align-items:center;gap:7px}input[type="range"]{width:130px}.toggle{display:flex;align-items:center;gap:8px}.toggle input{width:auto}video{display:none}</style></head><body><header><strong>360° Pole Simulator</strong><label>Video <input id="file" type="file" accept="video/mp4,video/*"></label><button id="play">Play / Pause</button><button id="track">Enable webcam tracking</button><button id="calibrate">Calibrate Head Tracking</button><button id="center">Recenter</button><button id="setCentre">Set as Centre</button><button id="resetCentre">Reset Video Centre</button><div class="settings-panel"><label>Horizontal <span id="horizontalRangeLabel">180° (90° left / 90° right)</span><input id="horizRange" type="range" min="30" max="360" step="10" value="180"></label><label>Vertical <span id="verticalRangeLabel">120° (60° up / 60° down)</span><input id="vertRange" type="range" min="30" max="180" step="10" value="120"></label><div id="viewingDirection" style="padding:6px 10px;border-radius:8px;background:rgba(255,255,255,0.04);white-space:nowrap;">Looking: 0° right, 0° up</div><div id="savedCentreDisplay" style="padding:6px 10px;border-radius:8px;background:rgba(255,255,255,0.04);white-space:nowrap;">Saved centre (global default): 0° right, 0° up</div></div><div class="settings-panel"><label>Horizontal <span id="horizontalValue">1.5×</span><input id="horizSens" type="range" min="0.5" max="3" step="0.1" value="1.5"></label><label>Vertical <span id="verticalValue">2.5×</span><input id="vertSens" type="range" min="0.5" max="5" step="0.1" value="2.5"></label><label>Smoothing <span id="smoothingValue">75%</span><input id="smoothing" type="range" min="0" max="100" step="1" value="75"></label><label>Dead Zone <span id="deadzoneValue">2°</span><input id="deadzone" type="range" min="0" max="10" step="0.5" value="2"></label><label>Max Speed <span id="maxspeedValue">120°/s</span><input id="maxspeed" type="range" min="20" max="240" step="10" value="120"></label><label class="toggle"><input id="invertVertical" type="checkbox">Invert Vertical Tracking</label></div></header><div id="scene"></div><div id="status">Choose your exported 360° MP4. Drag with the mouse to look around.</div><video id="video" playsinline loop crossorigin="anonymous"></video><video id="cam" autoplay playsinline muted></video><script type="module">
+import * as THREE from './vendor/three/three.module.js';
+import { FaceLandmarker, FilesetResolver } from './vendor/tasks-vision/vision_bundle.mjs';
+
+const $ = id => document.getElementById(id);
+const status = $('status');
+const video = $('video');
+const wasmBaseUrl = new URL('./vendor/tasks-vision/wasm/', window.location.href).href;
+const modelUrl = new URL('./vendor/models/face_landmarker.task', window.location.href).href;
+
+let yaw = 0, pitch = 0, baseYaw = 0, basePitch = 0, tracking = false, landmarker = null, previous = 0, neutral = null, stream = null, renderer = null;
+let dragging = false, x0 = 0, y0 = 0;
+let trackYaw = 0, trackPitch = 0, desiredTrackYaw = 0, desiredTrackPitch = 0, lastFrameTime = performance.now();
+let calibrationActive = false, calibrationStart = 0, calibrationSamples = [];
+let videoCenterYaw = 0, videoCenterPitch = 0;
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function degToRad(value) {
+  return value * Math.PI / 180;
+}
+
+function radToDeg(value) {
+  return value * 180 / Math.PI;
+}
+
+function normalizeAngleRadians(value) {
+  return ((value + Math.PI) % (Math.PI * 2)) - Math.PI;
+}
+
+function getVideoCenterStorageKey() {
+  const key = video.dataset.videoKey || 'global-default';
+  return `poleSimulatorVideoCenter:${key}`;
+}
+
+function getVideoCenterLabel() {
+  const key = video.dataset.videoKey || 'global-default';
+  return key === 'global-default' ? 'global default' : `video: ${key}`;
+}
+
+function saveVideoCentre() {
+  const payload = {
+    yaw: radToDeg(videoCenterYaw),
+    pitch: radToDeg(videoCenterPitch)
+  };
+  localStorage.setItem(getVideoCenterStorageKey(), JSON.stringify(payload));
+}
+
+function loadVideoCentre() {
+  const key = getVideoCenterStorageKey();
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return false;
+    const saved = JSON.parse(raw);
+    if (!saved || typeof saved !== 'object') return false;
+    const savedYaw = normalizeAngleRadians(degToRad(Number(saved.yaw || 0)));
+    const savedPitch = clamp(degToRad(Number(saved.pitch || 0)), -degToRad(89), degToRad(89));
+    videoCenterYaw = savedYaw;
+    videoCenterPitch = savedPitch;
+    return true;
+  } catch (error) {
+    console.warn('Failed to restore saved video centre', error);
+    return false;
+  }
+}
+
+function resetCameraToVideoCentre() {
+  yaw = 0;
+  pitch = 0;
+  baseYaw = 0;
+  basePitch = 0;
+  trackYaw = 0;
+  trackPitch = 0;
+  desiredTrackYaw = 0;
+  desiredTrackPitch = 0;
+  neutral = null;
+}
+
+function getHeadPoseFromLandmarks(faceLandmarks) {
+  const p = faceLandmarks[0], nose = p[1], left = p[33], right = p[263], top = p[10], bottom = p[152];
+  return {
+    x: (nose.x - (left.x + right.x) / 2) / Math.max(0.01, Math.abs(right.x - left.x)),
+    y: (nose.y - (top.y + bottom.y) / 2) / Math.max(0.01, Math.abs(bottom.y - top.y))
+  };
+}
+
+function averagePose(samples) {
+  if (!samples.length) return { x: 0, y: 0 };
+  let sumX = 0, sumY = 0;
+  for (const sample of samples) {
+    sumX += sample.x;
+    sumY += sample.y;
+  }
+  return { x: sumX / samples.length, y: sumY / samples.length };
+}
+
+function updateSettingLabels() {
+  const horizRange = Number($('horizRange').value);
+  const vertRange = Number($('vertRange').value);
+  const halfHoriz = horizRange / 2;
+  const halfVert = vertRange / 2;
+  $('horizontalRangeLabel').textContent = `${horizRange.toFixed(0)}° (${halfHoriz.toFixed(0)}° left / ${halfHoriz.toFixed(0)}° right)`;
+  $('verticalRangeLabel').textContent = `${vertRange.toFixed(0)}° (${halfVert.toFixed(0)}° up / ${halfVert.toFixed(0)}° down)`;
+  $('deadzoneValue').textContent = Number($('deadzone').value).toFixed(1) + '°';
+  $('smoothingValue').textContent = Number($('smoothing').value).toFixed(0) + '%';
+  $('horizontalValue').textContent = Number($('horizSens').value).toFixed(1) + '×';
+  $('verticalValue').textContent = Number($('vertSens').value).toFixed(1) + '×';
+  if ($('maxspeed')) $('maxspeedValue').textContent = Number($('maxspeed').value).toFixed(0) + '°/s';
+
+  const currentYaw = radToDeg(yaw || 0);
+  const currentPitch = radToDeg(pitch || 0);
+  const yawDirection = currentYaw >= 0 ? 'right' : 'left';
+  const pitchDirection = currentPitch >= 0 ? 'up' : 'down';
+  $('viewingDirection').textContent = `Looking: ${Math.abs(currentYaw).toFixed(0)}° ${yawDirection}, ${Math.abs(currentPitch).toFixed(0)}° ${pitchDirection}`;
+
+  const savedYaw = radToDeg(videoCenterYaw || 0);
+  const savedPitch = radToDeg(videoCenterPitch || 0);
+  const savedYawDirection = savedYaw >= 0 ? 'right' : 'left';
+  const savedPitchDirection = savedPitch >= 0 ? 'up' : 'down';
+  $('savedCentreDisplay').textContent = `Saved centre (${getVideoCenterLabel()}): ${Math.abs(savedYaw).toFixed(0)}° ${savedYawDirection}, ${Math.abs(savedPitch).toFixed(0)}° ${savedPitchDirection}`;
+}
+
+['deadzone', 'smoothing', 'horizSens', 'vertSens', 'invertVertical', 'maxspeed', 'horizRange', 'vertRange'].forEach(id => {
+  $(id).addEventListener('input', updateSettingLabels);
+  $(id).addEventListener('change', updateSettingLabels);
+});
+updateSettingLabels();
+
+try {
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(80, 1, 0.1, 1100);
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setClearColor(0x101820, 1);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  $('scene').appendChild(renderer.domElement);
+
+  const geometry = new THREE.SphereGeometry(500, 64, 40);
+  geometry.scale(-1, 1, 1);
+  const texture = new THREE.VideoTexture(video);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const sphere = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: texture }));
+  scene.add(sphere);
+
+  function resize() {
+    const rect = $('scene').getBoundingClientRect();
+    camera.aspect = rect.width / rect.height;
+    camera.updateProjectionMatrix();
+    renderer.setSize(rect.width, rect.height);
+  }
+
+  addEventListener('resize', resize);
+  resize();
+
+  function draw() {
+    requestAnimationFrame(draw);
+
+    const now = performance.now();
+    const dt = clamp((now - lastFrameTime) / 1000, 0.016, 0.1);
+    lastFrameTime = now;
+
+    if (calibrationActive) {
+      const elapsed = now - calibrationStart;
+      const remaining = Math.max(0, 3 - elapsed / 1000);
+      status.textContent = 'Sit comfortably, face the centre of the screen and look straight ahead. ' + remaining.toFixed(1) + 's';
+
+      if (tracking && landmarker && $('cam').readyState >= 2) {
+        const result = landmarker.detectForVideo($('cam'), now);
+        if (result.faceLandmarks?.length) {
+          const pose = getHeadPoseFromLandmarks(result.faceLandmarks);
+          calibrationSamples.push(pose);
+          const xSpread = Math.max(...calibrationSamples.map(s => Math.abs(s.x - pose.x))) || 0;
+          const ySpread = Math.max(...calibrationSamples.map(s => Math.abs(s.y - pose.y))) || 0;
+          if (xSpread > 0.5 || ySpread > 0.5) {
+            calibrationActive = false;
+            calibrationSamples = [];
+            status.textContent = 'Calibration failed: please stay still and keep your head centred. Try again.';
+            return;
+          }
+        } else {
+          calibrationActive = false;
+          calibrationSamples = [];
+          status.textContent = 'Calibration failed: face tracking was lost. Please try again.';
+          return;
+        }
+      } else {
+        calibrationActive = false;
+        calibrationSamples = [];
+        status.textContent = 'Calibration failed: webcam tracking is unavailable. Please enable the camera and try again.';
+        return;
+      }
+
+      if (elapsed >= 3000) {
+        if (calibrationSamples.length < 10) {
+          calibrationActive = false;
+          calibrationSamples = [];
+          status.textContent = 'Calibration failed: not enough stable samples. Please try again.';
+          return;
+        }
+
+        neutral = averagePose(calibrationSamples);
+        trackYaw = 0;
+        trackPitch = 0;
+        baseYaw = yaw;
+        basePitch = pitch;
+        calibrationActive = false;
+        calibrationSamples = [];
+        status.textContent = 'Calibration Complete';
+      }
+      return;
+    }
+
+    const maxHorizontalDeg = Number($('horizRange').value) / 2;
+    const maxVerticalDeg = Math.min(Number($('vertRange').value) / 2, 89);
+
+    if (tracking && landmarker && $('cam').readyState >= 2) {
+      if (now - previous > 60) {
+        previous = now;
+        const result = landmarker.detectForVideo($('cam'), now);
+        if (result.faceLandmarks?.length) {
+          const pose = getHeadPoseFromLandmarks(result.faceLandmarks);
+          if (!neutral) neutral = pose;
+
+          const horizontalSensitivity = Number($('horizSens').value);
+          const verticalSensitivity = Number($('vertSens').value);
+          const deadZoneDeg = Number($('deadzone').value);
+
+          let relativeYawDeg = (pose.x - neutral.x) * horizontalSensitivity * 90;
+          let relativePitchDeg = -(pose.y - neutral.y) * verticalSensitivity * 85;
+          if ($('invertVertical').checked) relativePitchDeg *= -1;
+
+          const targetYawDeg = Math.abs(relativeYawDeg) <= deadZoneDeg ? 0 : clamp(relativeYawDeg, -90, 90);
+          const targetPitchDeg = Math.abs(relativePitchDeg) <= deadZoneDeg ? 0 : clamp(relativePitchDeg, -85, 85);
+
+          desiredTrackYaw = degToRad(clamp(targetYawDeg, -maxHorizontalDeg, maxHorizontalDeg));
+          desiredTrackPitch = degToRad(clamp(targetPitchDeg, -maxVerticalDeg, maxVerticalDeg));
+        } else {
+          desiredTrackYaw *= 0.7;
+          desiredTrackPitch *= 0.7;
+          if (Math.abs(desiredTrackYaw) < 0.01) desiredTrackYaw = 0;
+          if (Math.abs(desiredTrackPitch) < 0.01) desiredTrackPitch = 0;
+        }
+      }
+    } else {
+      desiredTrackYaw *= 0.7;
+      desiredTrackPitch *= 0.7;
+      if (Math.abs(desiredTrackYaw) < 0.01) desiredTrackYaw = 0;
+      if (Math.abs(desiredTrackPitch) < 0.01) desiredTrackPitch = 0;
+    }
+
+    const smoothingPct = Number($('smoothing').value);
+    const maxSpeedDegPerSecond = Number($('maxspeed').value || 120);
+    const tauSeconds = 0.12 + ((100 - smoothingPct) / 100) * 0.7;
+    const alpha = 1 - Math.exp(-dt / Math.max(0.04, tauSeconds));
+
+    const nextTrackYaw = trackYaw + (desiredTrackYaw - trackYaw) * alpha;
+    const nextTrackPitch = trackPitch + (desiredTrackPitch - trackPitch) * alpha;
+    const maxStepYaw = degToRad(maxSpeedDegPerSecond * dt);
+    const maxStepPitch = degToRad(maxSpeedDegPerSecond * dt);
+    trackYaw = clamp(nextTrackYaw - trackYaw, -maxStepYaw, maxStepYaw) + trackYaw;
+    trackPitch = clamp(nextTrackPitch - trackPitch, -maxStepPitch, maxStepPitch) + trackPitch;
+
+    yaw = baseYaw + trackYaw;
+    pitch = clamp(basePitch + trackPitch, -degToRad(maxVerticalDeg), degToRad(maxVerticalDeg));
+    yaw = clamp(yaw, -degToRad(maxHorizontalDeg), degToRad(maxHorizontalDeg));
+
+    const renderedYaw = normalizeAngleRadians(yaw + videoCenterYaw);
+    const renderedPitch = clamp(pitch + videoCenterPitch, -degToRad(maxVerticalDeg), degToRad(maxVerticalDeg));
+
+    camera.rotation.order = 'YXZ';
+    camera.rotation.y = renderedYaw;
+    camera.rotation.x = renderedPitch;
+    renderer.render(scene, camera);
+    updateSettingLabels();
+  }
+
+  draw();
+
+  renderer.domElement.onpointerdown = e => {
+    dragging = true;
+    x0 = e.clientX;
+    y0 = e.clientY;
+    renderer.domElement.setPointerCapture(e.pointerId);
+  };
+  renderer.domElement.onpointerup = () => { dragging = false; };
+  renderer.domElement.onpointermove = e => {
+    if (!dragging) return;
+    const dx = e.clientX - x0;
+    const dy = e.clientY - y0;
+    x0 = e.clientX;
+    y0 = e.clientY;
+    const maxHorizontalDeg = Number($('horizRange').value) / 2;
+    const maxVerticalDeg = Math.min(Number($('vertRange').value) / 2, 89);
+    yaw -= dx * 0.004;
+    pitch = clamp(pitch - dy * 0.004, -degToRad(maxVerticalDeg), degToRad(maxVerticalDeg));
+    yaw = clamp(yaw, -degToRad(maxHorizontalDeg), degToRad(maxHorizontalDeg));
+    baseYaw = yaw;
+    basePitch = pitch;
+    neutral = null;
+  };
+  renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+} catch (error) {
+  console.error('Three.js initialisation failed', error);
+  status.textContent = 'Three.js failed to initialise: ' + (error && error.message ? error.message : String(error)) + '. WebGL is required for the 360° view.';
+  throw error;
+}
+
+video.addEventListener('error', () => {
+  const message = video.error && video.error.message ? video.error.message : 'Unknown video loading error';
+  console.error('Video failed to load', video.error);
+  status.textContent = 'Video failed to load: ' + message;
+});
+
+video.addEventListener('loadedmetadata', () => {
+  const fileName = video.dataset.fileName || 'video';
+  status.textContent = 'Loaded ' + fileName + '. Drag to look around or enable webcam tracking.';
+});
+
+$('file').onchange = () => {
+  const file = $('file').files[0];
+  if (!file) return;
+  video.dataset.fileName = file.name;
+  video.dataset.videoKey = file.name || 'global-default';
+  videoCenterYaw = 0;
+  videoCenterPitch = 0;
+  loadVideoCentre();
+  resetCameraToVideoCentre();
+  video.src = URL.createObjectURL(file);
+  video.load();
+  video.play().catch(() => {});
+};
+
+if (loadVideoCentre()) {
+  resetCameraToVideoCentre();
+}
+
+$('play').onclick = () => {
+  video.paused ? video.play().catch(() => {}) : video.pause();
+};
+
+$('center').onclick = () => {
+  if (tracking && landmarker && $('cam').readyState >= 2) {
+    const result = landmarker.detectForVideo($('cam'), performance.now());
+    if (result.faceLandmarks?.length) {
+      neutral = getHeadPoseFromLandmarks(result.faceLandmarks);
+      trackYaw = 0;
+      trackPitch = 0;
+      desiredTrackYaw = 0;
+      desiredTrackPitch = 0;
+      baseYaw = 0;
+      basePitch = 0;
+      yaw = 0;
+      pitch = 0;
+      status.textContent = 'Tracking recentered to the saved video centre.';
+      return;
+    }
+  }
+
+  neutral = { x: 0, y: 0 };
+  trackYaw = 0;
+  trackPitch = 0;
+  desiredTrackYaw = 0;
+  desiredTrackPitch = 0;
+  baseYaw = 0;
+  basePitch = 0;
+  yaw = 0;
+  pitch = 0;
+  status.textContent = 'Recentered to the saved video centre. Keep your head still while the view settles.';
+};
+
+$('setCentre').onclick = () => {
+  const maxVerticalDeg = Math.min(Number($('vertRange').value) / 2, 89);
+  const currentActualYaw = normalizeAngleRadians(videoCenterYaw + yaw);
+  const currentActualPitch = clamp(videoCenterPitch + pitch, -degToRad(maxVerticalDeg), degToRad(maxVerticalDeg));
+  videoCenterYaw = currentActualYaw;
+  videoCenterPitch = currentActualPitch;
+  saveVideoCentre();
+  resetCameraToVideoCentre();
+  status.textContent = `Video centre set to ${Math.abs(radToDeg(videoCenterYaw)).toFixed(0)}° ${radToDeg(videoCenterYaw) >= 0 ? 'right' : 'left'}, ${Math.abs(radToDeg(videoCenterPitch)).toFixed(0)}° ${radToDeg(videoCenterPitch) >= 0 ? 'up' : 'down'}.`;
+};
+
+$('resetCentre').onclick = () => {
+  videoCenterYaw = 0;
+  videoCenterPitch = 0;
+  saveVideoCentre();
+  resetCameraToVideoCentre();
+  status.textContent = 'Video centre reset to the original 360° orientation.';
+};
+
+$('calibrate').onclick = async () => {
+  if (!tracking || !landmarker || $('cam').readyState < 2) {
+    status.textContent = 'Enable webcam tracking before calibrating.';
+    return;
+  }
+
+  calibrationActive = true;
+  calibrationStart = performance.now();
+  calibrationSamples = [];
+  status.textContent = 'Sit comfortably, face the centre of the screen and look straight ahead. 3.0s';
+};
+
+$('track').onclick = async () => {
+  if (tracking) {
+    tracking = false;
+    calibrationActive = false;
+    stream?.getTracks().forEach(track => track.stop());
+    $('track').textContent = 'Enable webcam tracking';
+    status.textContent = 'Webcam stopped';
+    return;
+  }
+
+  try {
+    status.textContent = 'Loading face tracker from local files...';
+    if (!landmarker) {
+      const vision = await FilesetResolver.forVisionTasks(wasmBaseUrl);
+      landmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: modelUrl,
+          delegate: 'CPU'
+        },
+        runningMode: 'VIDEO',
+        numFaces: 1
+      });
+    }
+
+    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    $('cam').srcObject = stream;
+    await $('cam').play();
+    neutral = null;
+    trackYaw = 0;
+    trackPitch = 0;
+    baseYaw = yaw;
+    basePitch = pitch;
+    tracking = true;
+    $('track').textContent = 'Disable webcam tracking';
+    status.textContent = 'Tracking enabled. Press Calibrate Head Tracking to set your neutral position.';
+  } catch (error) {
+    console.error('Webcam tracker failed', error);
+    status.textContent = 'Webcam/tracker error: ' + (error && error.message ? error.message : String(error));
+  }
+};
+</script></body></html>
